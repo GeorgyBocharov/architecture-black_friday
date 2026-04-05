@@ -1,21 +1,25 @@
+import inspect
+import hashlib
 import json
 import logging
 import os
-import time
+import sys
+import asyncio
 from typing import List, Optional
 
 import motor.motor_asyncio
 from bson import ObjectId
 from fastapi import Body, FastAPI, HTTPException, status
-from fastapi_cache import FastAPICache
-from fastapi_cache.backends.redis import RedisBackend
-from fastapi_cache.decorator import cache
 from logmiddleware import RouterLoggingMiddleware, logging_config
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, Field
 from pydantic.functional_validators import BeforeValidator
 from pymongo import errors
-from redis import asyncio as aioredis
+from redis.cluster import RedisCluster, ClusterNode
 from typing_extensions import Annotated
+
+print("=" * 60, flush=True)
+print("APP STARTING", flush=True)
+print("=" * 60, flush=True)
 
 # Configure JSON logging
 logging.config.dictConfig(logging_config)
@@ -31,33 +35,81 @@ DATABASE_URL = os.environ["MONGODB_URL"]
 DATABASE_NAME = os.environ["MONGODB_DATABASE_NAME"]
 REDIS_URL = os.getenv("REDIS_URL", None)
 
-
-def nocache(*args, **kwargs):
-    def decorator(func):
-        return func
-
-    return decorator
-
-
-if REDIS_URL:
-    cache_decorator = cache
-else:
-    cache_decorator = nocache
-
+print(f"REDIS_URL={REDIS_URL}", flush=True)
 
 client = motor.motor_asyncio.AsyncIOMotorClient(DATABASE_URL)
 db = client[DATABASE_NAME]
 
-# Represents an ObjectId field in the database.
-# It will be represented as a `str` on the model so that it can be serialized to JSON.
 PyObjectId = Annotated[str, BeforeValidator(str)]
+
+# Глобальный клиент Redis
+redis_client = None
 
 
 @app.on_event("startup")
 async def startup():
+    global redis_client
     if REDIS_URL:
-        redis = aioredis.from_url(REDIS_URL, encoding="utf8", decode_responses=True)
-        FastAPICache.init(RedisBackend(redis), prefix="api:cache")
+        try:
+            # Парсим URL для кластера
+            parts = REDIS_URL.replace("redis://", "").split("@")
+            password = parts[0].replace(":", "") if len(parts) > 1 else None
+            hosts_part = parts[1] if len(parts) > 1 else parts[0]
+            
+            startup_nodes = []
+            for host_port in hosts_part.split(","):
+                host, port = host_port.split(":")
+                startup_nodes.append(ClusterNode(host, int(port)))
+
+            redis_client = RedisCluster(
+                startup_nodes=startup_nodes,
+                password=password,
+                decode_responses=True
+            )
+            
+
+            redis_client.ping()
+            print("✓ Redis Cluster connected successfully", flush=True)
+        except Exception as e:
+            print(f"✗ Redis connection failed: {e}", flush=True)
+            redis_client = None
+    else:
+        print("Redis not configured", flush=True)
+
+
+def cache_result(ttl: int = 60):
+    """Простой декоратор кэширования для Redis Cluster"""
+    def decorator(func):
+        async def wrapper(*args, **kwargs):
+            global redis_client
+            if not redis_client:
+                # Если Redis недоступен, просто вызываем функцию
+                return await func(*args, **kwargs)
+            
+            # Создаем уникальный ключ
+            key_data = f"{func.__name__}:{args}:{sorted(kwargs.items())}"
+            cache_key = f"api:cache:{key_data}"
+            
+            try:
+                # Пробуем получить из кэша
+                cached = redis_client.get(cache_key)
+                if cached:
+                    print(f"✓ CACHE HIT: {cache_key}", flush=True)
+                    return json.loads(cached)
+                
+                print(f"✗ CACHE MISS: {cache_key}", flush=True)
+                result = await func(*args, **kwargs)
+                
+                # Сохраняем в кэш
+                redis_client.setex(cache_key, ttl, json.dumps(result.dict(by_alias=True), default=str))
+                return result
+            except Exception as e:
+                print(f"Cache error: {e}", flush=True)
+                return await func(*args, **kwargs)
+        
+        wrapper.__signature__ = inspect.signature(func)
+        return wrapper
+    return decorator
 
 
 class UserModel(BaseModel):
@@ -114,14 +166,10 @@ async def root():
         "mongo_replicaset_name": replicaset_name,
         "mongo_db": DATABASE_NAME,
         "read_preference": str(read_preference),
-        "mongo_nodes": client.nodes,
-        "mongo_primary_host": client.primary,
-        "mongo_secondary_hosts": client.secondaries,
-        "mongo_is_primary": client.is_primary,
-        "mongo_is_mongos": client.is_mongos,
         "collections": collections,
         "shards": shards,
         "cache_enabled": cache_enabled,
+        "redis_connected": redis_client is not None,
         "status": "OK",
     }
 
@@ -130,8 +178,6 @@ async def root():
 async def collection_count(collection_name: str):
     collection = db.get_collection(collection_name)
     items_count = await collection.count_documents({})
-    # status = await client.admin.command('replSetGetStatus')
-    # import ipdb; ipdb.set_trace()
     return {"status": "OK", "mongo_db": DATABASE_NAME, "items_count": items_count}
 
 
@@ -141,15 +187,18 @@ async def collection_count(collection_name: str):
     response_model=UserCollection,
     response_model_by_alias=False,
 )
-@cache_decorator(expire=60 * 1)
+@cache_result(ttl=60)  # ← используем наш декоратор
 async def list_users(collection_name: str):
     """
     List all of the user data in the database.
     The response is unpaginated and limited to 1000 results.
     """
-    time.sleep(1)
+    print(f"=== Computing list_users for {collection_name} ===", flush=True)
+    await asyncio.sleep(3)  # 3 секунды задержки для проверки кэша
     collection = db.get_collection(collection_name)
-    return UserCollection(users=await collection.find().to_list(1000))
+    users = await collection.find().to_list(1000)
+    print(f"Found {len(users)} users", flush=True)
+    return UserCollection(users=users)
 
 
 @app.get(
@@ -189,3 +238,7 @@ async def create_user(collection_name: str, user: UserModel = Body(...)):
     )
     created_user = await collection.find_one({"_id": new_user.inserted_id})
     return created_user
+
+print("=" * 60, flush=True)
+print("APP MODULE LOADED", flush=True)
+print("=" * 60, flush=True)

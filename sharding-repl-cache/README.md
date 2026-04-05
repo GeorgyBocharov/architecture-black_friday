@@ -1,16 +1,13 @@
 ### Задание 2. Настройка шардирования с репликацикей mongo-db
 
-В данном задании я релизовал шардирование с репликацикей mongo-db
+В данном задании я релизовал кластер редиса: 3 ноды, replication factor 3.
+Запуск кластера выполняется через контейнер redis-cluster-init и скрипт [text](init-scripts/redis/init-cluster.sh)
 
-## Описание docker-compose
-В докер-компоуз файле я завел: 
-1) 3 реплики для configSrv 
-2) 3 реплики для shard1
-3) 3 реплики для shard2
-4) 3 реплики для mongo_router
+
+Также я доработал pymongo_api для работы с RedisCluster. Приложение запускается и возвращает закешированные данные 
 
 Итоговые контейнеры
 
-![Результат запуска](screenshots\mongo-containers.png)
+![Результат запуска](screenshots\redis-setup.png)
 
-![Результат запуска](screenshots\mongo-script-results.png)
+![Результат запуска](screenshots\cache-hit-miss.png)
