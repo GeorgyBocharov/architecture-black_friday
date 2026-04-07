@@ -1,0 +1,173 @@
+version: '3.8'
+
+services:
+  configSrv:
+    image:  dh-mirror.gitverse.ru/mongo:latest
+    container_name: configSrv 
+    restart: always
+    ports:
+      - "27017:27017"
+    networks:
+      - app-network
+    volumes:
+      - config-data:/data/db
+    command:
+      [
+        "--configsvr",  # запуск в режиме конфигурации
+        "--replSet", "config_server", # конфиг сервер должен запускаться в режиме репликации, но мы тут задаем replica-set  config_server с одним элемнтом для простоты
+        "--bind_ip_all", 
+        "--port",
+        "27017"
+      ] 
+    healthcheck:
+      test: [ "CMD", "mongosh", "--eval", "db.adminCommand('ping')" ]
+      interval: 5s
+      start_period: 10s
+      retries: 5
+
+
+  shard1:
+    image: dh-mirror.gitverse.ru/mongo:latest
+    container_name: shard1
+    restart: always
+    ports:
+      - "27018:27018"
+    networks:
+      - app-network
+    volumes:
+      - shard1-data:/data/db
+    command:
+      [
+        "--shardsvr",  # запуск в режиме шардинга
+        "--replSet",
+        "shard1", # название реплики
+        "--bind_ip_all",
+        "--port",
+        "27018"
+      ]
+    healthcheck:
+      test: [ "CMD", "mongosh", "--port", "27018", "--eval", "db.adminCommand('ping')" ]
+      interval: 5s
+      start_period: 10s
+      retries: 5
+
+  shard2:
+    image: dh-mirror.gitverse.ru/mongo:latest
+    container_name: shard2
+    restart: always
+    ports:
+      - "27019:27019"
+    networks:
+      - app-network
+    volumes:
+      - shard2-data:/data/db
+    command:
+      [
+        "--shardsvr", 
+        "--replSet",
+        "shard2",
+        "--bind_ip_all",
+        "--port",
+        "27019"
+      ]
+    healthcheck:
+      test: [ "CMD", "mongosh", "--port", "27019", "--eval", "db.adminCommand('ping')" ]
+      interval: 5s
+      start_period: 10s
+      retries: 5
+  
+  mongos_router:
+    image: dh-mirror.gitverse.ru/mongo:latest
+    container_name: mongos_router
+    restart: always
+    ports:
+      - "27020:27020"
+    networks:
+      - app-network
+    command:
+      [
+        "mongos",  # обычная mongo в режиме роутера
+        "--configdb", 
+        "config_server/configSrv:27017",  # передача данных сервера конфигурации
+        "--bind_ip_all", # слушаем все сетевые интерфейсы контейнера (без этого слушаем только localhost)
+        "--port",
+        "27020"
+      ]
+    healthcheck:
+      test: [ "CMD", "mongosh", "--port", "27020", "--eval", "db.adminCommand('ping')" ]
+      interval: 5s
+      start_period: 10s
+      retries: 5
+    depends_on:
+      configSrv:
+        condition: service_healthy
+      shard1:
+        condition: service_healthy
+      shard2:
+        condition: service_healthy
+
+  mongo_init_replicas:
+    profiles: 
+      - init
+    container_name: mongo_init_replicas
+    volumes:
+      - ./init-scripts/init-replicas:/scripts:ro
+    environment:
+      - DB_NAME=mobile_world
+      - COLLECTION_NAME=users
+    image: dh-mirror.gitverse.ru/mongo:latest
+    depends_on:
+      configSrv:
+        condition: service_healthy
+      shard1:
+        condition: service_healthy
+      shard2:
+        condition: service_healthy
+    networks:
+      - app-network
+    entrypoint: ["/bin/bash", "/scripts/entrypoint.sh"]
+    restart: "no"
+
+  mongo_init_cluster:
+    container_name: mongo_init_cluster
+    profiles: 
+      - init
+    volumes:
+      - ./init-scripts/configure-cluster:/scripts:ro
+    environment:
+      - DB_NAME=mobile_world
+      - COLLECTION_NAME=users
+    image: dh-mirror.gitverse.ru/mongo:latest
+    depends_on:
+      mongos_router:
+        condition: service_healthy
+    networks:
+      - app-network
+    entrypoint: ["/bin/bash", "/scripts/entrypoint.sh"]
+    restart: "no"
+
+  pymongo_api:
+    container_name: pymongo_api
+    build: 
+      context: api_app
+      dockerfile: Dockerfile
+    depends_on:
+      mongos_router:
+        condition: service_healthy
+    ports:
+      - 8080:8080
+    networks:
+      - app-network
+    environment:
+      MONGODB_URL: "mongodb://mongos_router"
+      MONGODB_DATABASE_NAME: "mobile_world"
+
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  config-data:
+  shard1-data:
+  shard2-data:
