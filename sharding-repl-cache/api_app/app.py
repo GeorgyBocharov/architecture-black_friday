@@ -159,7 +159,9 @@ async def root():
 
     cache_enabled = False
     if REDIS_URL:
-        cache_enabled = FastAPICache.get_enable()
+        cache_enabled = True
+
+    redis_status = await get_redis_cluster_status()
 
     return {
         "mongo_topology_type": topology_type,
@@ -169,7 +171,7 @@ async def root():
         "collections": collections,
         "shards": shards,
         "cache_enabled": cache_enabled,
-        "redis_connected": redis_client is not None,
+        "redis": redis_status,
         "status": "OK",
     }
 
@@ -238,6 +240,111 @@ async def create_user(collection_name: str, user: UserModel = Body(...)):
     )
     created_user = await collection.find_one({"_id": new_user.inserted_id})
     return created_user
+
+async def get_redis_cluster_status():
+    """Получение статуса Redis кластера"""
+    redis_status = {
+        "enabled": False,
+        "connected": False,
+        "cluster_size": None,
+        "nodes_count": None,
+        "cluster_state": None,
+        "masters": [],
+    }
+    
+    if not REDIS_URL:
+        redis_status["enabled"] = False
+        return redis_status
+    
+    redis_status["enabled"] = True
+    
+    if not redis_client:
+        redis_status["connected"] = False
+        return redis_status
+    
+    try:
+        # Проверяем соединение
+        redis_client.ping()
+        redis_status["connected"] = True
+        
+        # Получаем информацию о кластере
+        cluster_info = redis_client.cluster_info()
+        if cluster_info:
+            redis_status["cluster_state"] = cluster_info.get("cluster_state")
+            redis_status["cluster_size"] = int(cluster_info.get("cluster_size", 0))
+            redis_status["nodes_count"] = int(cluster_info.get("cluster_known_nodes", 0))
+        
+        # Получаем список всех нод через CLUSTER NODES
+        cluster_nodes_output = redis_client.execute_command('CLUSTER', 'NODES')
+        
+        masters = []
+        replicas = []
+        
+        if cluster_nodes_output:
+            for line in cluster_nodes_output.strip().split('\n'):
+                if not line.strip():
+                    continue
+                    
+                parts = line.split()
+                if len(parts) < 8:
+                    continue
+                
+                node_id = parts[0]
+                host_port = parts[1]
+                flags = parts[2]
+                master_id = parts[3]
+                
+                # Разбираем host и port
+                if '@' in host_port:
+                    host_port = host_port.split('@')[0]
+                host, port = host_port.split(':')
+                
+                # Определяем роль
+                is_master = 'master' in flags and 'slave' not in flags
+                is_slave = 'slave' in flags or 'master' not in flags and master_id != '-'
+                
+                node_info = {
+                    "id": node_id,
+                    "host": host,
+                    "port": int(port),
+                    "flags": flags,
+                }
+                
+                if is_master:
+                    node_info["replicas_count"] = 0
+                    masters.append(node_info)
+                else:
+                    # Это реплика
+                    node_info["master_id"] = master_id if master_id != '-' else None
+                    replicas.append(node_info)
+        
+        # Связываем реплики с мастерами
+        for master in masters:
+            master["replicas"] = [
+                {
+                    "host": r["host"],
+                    "port": r["port"],
+                    "id": r["id"]
+                }
+                for r in replicas if r.get("master_id") == master["id"]
+            ]
+            master["replicas_count"] = len(master["replicas"])
+        
+        redis_status["masters"] = masters
+        
+        # Добавляем краткую сводку
+        redis_status["summary"] = {
+            "masters_count": len(masters),
+            "replicas_count": len(replicas),
+            "total_nodes": len(masters) + len(replicas),
+        }
+        
+    except Exception as e:
+        redis_status["connected"] = False
+        redis_status["error"] = str(e)
+        
+    return redis_status
+
 
 print("=" * 60, flush=True)
 print("APP MODULE LOADED", flush=True)
